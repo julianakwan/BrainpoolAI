@@ -6,6 +6,10 @@ import os
 from app import app
 import urllib.request
 from flask import Flask, flash, request, redirect, url_for, render_template
+import grpc
+from tensorflow import make_tensor_proto, make_ndarray
+from tensorflow_serving.apis import predict_pb2
+from tensorflow_serving.apis import prediction_service_pb2_grpc
 from werkzeug.utils import secure_filename
 
 ALLOWED_EXTENSIONS = set(['png', 'jpg', 'jpeg', 'gif'])
@@ -19,6 +23,13 @@ def upload_form():
 
 @app.route('/', methods=['POST'])
 def upload_image():
+
+    address = "localhost:9000"  #check this...
+
+    channel = grpc.insecure_channel(address)
+
+    stub = prediction_service_pb2_grpc.PredictionServiceStub(channel)
+    
     if 'file' not in request.files:
         flash('No file part')
         return redirect(request.url)
@@ -29,10 +40,12 @@ def upload_image():
     if file and allowed_file(file.filename):
         filename = secure_filename(file.filename)
         file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
-#        print('Hello World\n')
-        output_image = transform_image(filename)
+
+        output_image = call_openvino_server(stub, filename)
+            
+#        output_image = transform_image(filename)
         output_filename = 'test.jpg'
-        output_image.save('static/uploads/'+output_filename)
+        output_image.save(os.path.join(app.config['UPLOAD_FOLDER'], output_filename))
 
         flash('Image successfully uploaded and displayed below')
         return render_template('upload.html', input_filename=filename, output_filename=output_filename)
@@ -56,6 +69,49 @@ def to_rgb(image_data) -> np.ndarray:
     Convert image_data from BGR to RGB
     """
     return cv2.cvtColor(image_data, cv2.COLOR_BGR2RGB)
+
+
+def call_openvino_server(stub, image_name):
+    openvino_request = predict_pb2.PredictRequest()
+    openvino_request.model_spec.name  = "fast-neural-style-mosaic"
+    
+    image_file = "/Users/jkwan/Documents/jobs/BrainpoolAI/static/uploads/"+image_name
+    input_image = Image.open(image_file)
+
+    input_image_height, input_image_width = input_image.size
+    
+
+    print(openvino_request.inputs.keys())    
+    
+    #resize the image for the model dimensions
+    network_image_height = 224
+    network_image_width  = 224
+    
+    input_image = input_image.resize((network_image_height, network_image_width))
+    input_image = np.array(input_image).astype('float32')
+
+    #model expects BRG not RBG
+    input_image = np.transpose(input_image,[2,0,1])
+    input_image = np.expand_dims(input_image, axis=0)
+
+    openvino_request.inputs["input1"].CopyFrom(make_tensor_proto(input_image, shape=(input_image.shape)))
+    result = stub.Predict(openvino_request)
+    
+    #reverse the pre-processing steps
+
+    output_image = make_ndarray(result.outputs["output1"])
+    print("Response shape", output_image.shape)
+    
+#    result = np.array(result.outputs["output1"]).astype('float32')
+    output_image = output_image.reshape(3,network_image_height, network_image_width)
+
+
+    output_image = output_image.transpose(1,2,0)
+        
+    output_image = Image.fromarray(output_image.astype("uint8"), 'RGB')
+    output_image = output_image.resize((input_image_height, input_image_width))
+    return output_image
+
 
 def transform_image(image_name):
     model_path = "/Users/jkwan/Documents/jobs/BrainpoolAI/public/fast-neural-style-mosaic-onnx/fast-neural-style-mosaic-onnx.onnx"
